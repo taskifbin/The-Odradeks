@@ -1,266 +1,348 @@
-from __future__ import annotations
-
-import json
-import logging
 import os
 import re
-from typing import Any, Dict, List, Optional
+import json
+import logging
+from typing import Any
 
+from pathlib import Path
 from openai import AsyncOpenAI
+from dotenv import load_dotenv
 
-from .schemas import Battery
+from app.schemas import Battery
+
+load_dotenv()
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+if _env_path.exists():
+    load_dotenv(dotenv_path=_env_path)
 
 logger = logging.getLogger(__name__)
 
-MODEL = os.getenv("PUKU_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 
-client = AsyncOpenAI(
-    api_key=os.getenv("PUKU_API_KEY", "dummy_key_for_local_test"),
-    base_url=os.getenv("PUKU_BASE_URL", "https://api.puku.sh/v1"),
-)
+def _get_client() -> AsyncOpenAI:
+    load_dotenv()
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
+    if _env_path.exists():
+        load_dotenv(dotenv_path=_env_path, override=True)
 
-SYSTEM_PROMPT = """You convert campus operator notes into structured energy directives.
+    api_key = os.getenv("PUKU_API_KEY")
+    base_url = os.getenv("PUKU_BASE_URL", "https://api.puku.sh/v1")
+    timeout = float(os.getenv("PUKU_TIMEOUT_SECONDS", "12"))
+    max_retries = int(os.getenv("PUKU_MAX_RETRIES", "1"))
 
-Supported directive types ONLY:
-- solar_reduction: {"hours": [...], "factor": number}   (usable fraction remaining, 0 to 1)
-- minimum_battery_reserve: {"hours": [...], "minimum_energy_kwh": number}
-- no_charge_window: {"hours": [...]}
-- no_discharge_window: {"hours": [...]}
-- max_grid_window: {"hours": [...], "max_grid_kwh": number}
-- no_op: structured_adjustment is null
+    return AsyncOpenAI(
+        api_key=api_key or "missing-puku-api-key",
+        base_url=base_url,
+        timeout=timeout,
+        max_retries=max_retries,
+    )
 
-Rules:
-- Every note produces exactly one entry, in note_index order.
-- Hours use the [start, end) convention: "1 PM to 3 PM" -> hours [13, 14].
-- Never invent demand, tariff, solar, or battery numbers that are not stated in the note.
-- Never invent a directive type outside the six supported types.
-- If a note doesn't affect the 24-hour energy schedule, mark it no_op.
-- Respond with a JSON object only — no prose, no markdown fences.
-Format:
+
+client = _get_client()
+
+
+SYSTEM_PROMPT = """You are an expert smart-campus energy operator assistant.
+
+Your job is to interpret 1 to 3 natural-language operator notes into structured directives
+for a 24-hour energy optimization system.
+
+You must return ONLY valid JSON. Do not return markdown. Do not return explanations outside JSON.
+
+Allowed directive types:
+1. solar_reduction
+   Meaning: Reduce usable solar during specific hours.
+   Required structured_adjustment:
+   {
+     "hours": [unique integers 0-23 in ascending order],
+     "factor": number between 0 and 1
+   }
+
+   IMPORTANT: factor is the REMAINING usable fraction.
+   Examples:
+   - "drop to 20%" => factor = 0.2
+   - "80% reduction" => factor = 0.2
+   - "one-fifth of normal solar output" => factor = 0.2
+   - "reduce by 50%" => factor = 0.5
+
+2. minimum_battery_reserve
+   Meaning: Keep battery energy at or above a required level during specific hours.
+   Required structured_adjustment:
+   {
+     "hours": [unique integers 0-23 in ascending order],
+     "minimum_energy_kwh": non-negative number
+   }
+
+3. no_charge_window
+   Meaning: Battery charging is unavailable during specific hours.
+   Required structured_adjustment:
+   {
+     "hours": [unique integers 0-23 in ascending order]
+   }
+
+4. no_discharge_window
+   Meaning: Battery discharging is unavailable during specific hours.
+   Required structured_adjustment:
+   {
+     "hours": [unique integers 0-23 in ascending order]
+   }
+
+5. max_grid_window
+   Meaning: Grid import may not exceed a stated amount during specific hours.
+   Required structured_adjustment:
+   {
+     "hours": [unique integers 0-23 in ascending order],
+     "max_grid_kwh": non-negative number
+   }
+
+6. no_op
+   Meaning: The note does not affect the current 24-hour energy schedule.
+   Required structured_adjustment: null
+   Required applies: false
+
+STRICT TIME RULE:
+- Time windows are start-inclusive and end-exclusive.
+- "1 PM to 3 PM" means hours [13, 14], not [13, 14, 15].
+- "2 PM to 4 PM" means hours [14, 15].
+- "6 PM until 9 PM" means hours [18, 19, 20].
+- "13:00 to 15:00" means hours [13, 14].
+
+STRICT OUTPUT RULE:
+Return a JSON object with exactly one top-level key:
+
 {
-  "directives": [
+  "interpretations": [
     {
       "note_index": 0,
-      "applies": true,
-      "directive_type": "solar_reduction",
-      "structured_adjustment": {"hours": [13, 14], "factor": 0.2},
-      "explanation": "Solar output will drop to 20% from 1 PM to 3 PM."
+      "applies": true or false,
+      "directive_type": "one of the allowed directive types",
+      "structured_adjustment": { ... } or null,
+      "explanation": "short human-readable reason"
     }
   ]
+}
+
+Rules:
+- There must be exactly one interpretation object for every operator note.
+- note_index must be zero-based and match the input note order.
+- For no_op:
+  applies must be false
+  structured_adjustment must be null
+- For every non-no_op directive:
+  applies must be true
+  structured_adjustment must contain the required fields
+- Do not invent unsupported directive types.
+- Do not change demand, tariff, battery capacity, base minimum energy, or charge/discharge rates unless a supported directive explicitly allows it.
+- If a note is irrelevant, distractor, cosmetic, future-only, unrelated to today's 24-hour energy schedule, or impossible to map to a supported directive, use no_op.
+- Be robust to paraphrasing. The same rule may be written in many different ways.
+
+Examples:
+
+Note: "Solar output will drop to about 20% from 1 PM to 3 PM."
+Output directive:
+{
+  "applies": true,
+  "directive_type": "solar_reduction",
+  "structured_adjustment": {
+    "hours": [13, 14],
+    "factor": 0.2
+  },
+  "explanation": "Solar availability is reduced to 20% during the maintenance window."
+}
+
+Note: "Expect an 80% reduction in rooftop solar during the 1-3 PM maintenance window."
+Output directive:
+{
+  "applies": true,
+  "directive_type": "solar_reduction",
+  "structured_adjustment": {
+    "hours": [13, 14],
+    "factor": 0.2
+  },
+  "explanation": "An 80% reduction means 20% solar output remains."
+}
+
+Note: "Do not charge the battery between 2 PM and 4 PM."
+Output directive:
+{
+  "applies": true,
+  "directive_type": "no_charge_window",
+  "structured_adjustment": {
+    "hours": [14, 15]
+  },
+  "explanation": "Battery charging is disabled from 2 PM to 4 PM."
+}
+
+Note: "Keep at least 120 kWh in reserve from 6 PM until 9 PM."
+Output directive:
+{
+  "applies": true,
+  "directive_type": "minimum_battery_reserve",
+  "structured_adjustment": {
+    "hours": [18, 19, 20],
+    "minimum_energy_kwh": 120
+  },
+  "explanation": "Battery reserve must stay at or above 120 kWh during the evening event window."
+}
+
+Note: "The cafeteria menu changes tomorrow."
+Output directive:
+{
+  "applies": false,
+  "directive_type": "no_op",
+  "structured_adjustment": null,
+  "explanation": "This note does not affect today's 24-hour energy schedule."
 }
 """
 
 
-def _build_user_prompt(operator_notes: List[str]) -> str:
-    notes_block = "\n".join(f"{i}: {note}" for i,
-                            note in enumerate(operator_notes))
-    return (
-        f"Operator notes (note_index: text):\n{notes_block}\n\n"
-        f"Return one directive_interpretation entry per note, in note_index order as JSON."
-    )
-
-
-def _parse_hour_window(text: str) -> List[int]:
-    """Parse time window phrases like '1 PM to 3 PM' into [start, end) hour integers."""
-    t = text.lower()
-    # Match patterns like '1 pm to 3 pm', 'between 2 pm and 4 pm'
-    m = re.search(
-        r"(?:from|between)?\s*(\d{1,2})(?::00)?\s*(am|pm)?\s*(?:to|and|-)\s*(\d{1,2})(?::00)?\s*(am|pm)",
-        t,
-    )
-    if m:
-        h1_str, p1_str, h2_str, p2_str = m.groups()
-        h1, h2 = int(h1_str), int(h2_str)
-        p2 = p2_str.lower()
-        p1 = p1_str.lower() if p1_str else p2
-
-        if p1 == "pm" and h1 < 12:
-            h1 += 12
-        if p1 == "am" and h1 == 12:
-            h1 = 0
-        if p2 == "pm" and h2 < 12:
-            h2 += 12
-        if p2 == "am" and h2 == 12:
-            h2 = 0
-
-        if h1 < h2:
-            return list(range(h1, h2))
-        elif h1 > h2:
-            return list(range(h1, 24)) + list(range(0, h2))
-
-    # Match simple hour ranges like "hours 13 to 15"
-    m2 = re.search(r"hours?\s*(\d{1,2})\s*(?:to|-)\s*(\d{1,2})", t)
-    if m2:
-        h1, h2 = int(m2.group(1)), int(m2.group(2))
-        if 0 <= h1 < h2 <= 24:
-            return list(range(h1, h2))
-
-    return []
-
-
-def _heuristic_fallback(operator_notes: List[str]) -> List[Dict[str, Any]]:
-    """Heuristic interpreter for notes if the LLM provider is unreachable."""
-    results: List[Dict[str, Any]] = []
-    for idx, note in enumerate(operator_notes):
-        lower = note.lower()
-        hours = _parse_hour_window(note)
-
-        # 1. Solar reduction
-        if "solar" in lower and any(w in lower for w in ["drop", "reduc", "curtail", "cut"]):
-            m_to = re.search(
-                r"(?:drop|fall|cut|curtail|reduc\w*)\s+to\s+(\d+(?:\.\d+)?)\s*%", lower)
-            m_by = re.search(
-                r"(?:drop|fall|cut|curtail|reduc\w*)\s+by\s+(\d+(?:\.\d+)?)\s*%", lower)
-            m_gen = re.search(r"(\d+(?:\.\d+)?)\s*%", lower)
-
-            if m_to:
-                factor = float(m_to.group(1)) / 100.0
-            elif m_by:
-                factor = max(0.0, 1.0 - float(m_by.group(1)) / 100.0)
-            elif m_gen:
-                factor = float(m_gen.group(1)) / 100.0
-            else:
-                factor = 0.5
-
-            factor = max(0.0, min(1.0, factor))
-            if not hours:
-                hours = [11, 12, 13, 14]
-
-            results.append({
-                "note_index": idx,
-                "applies": True,
-                "directive_type": "solar_reduction",
-                "structured_adjustment": {"hours": hours, "factor": factor},
-                "explanation": note,
-            })
-            continue
-
-        # 2. No charge window
-        if any(p in lower for p in ["no charge", "do not charge", "don't charge", "stop charge", "stop charging"]):
-            results.append({
-                "note_index": idx,
-                "applies": True,
-                "directive_type": "no_charge_window",
-                "structured_adjustment": {"hours": hours if hours else [14, 15]},
-                "explanation": note,
-            })
-            continue
-
-        # 3. No discharge window
-        if any(p in lower for p in ["no discharge", "do not discharge", "don't discharge", "stop discharge"]):
-            results.append({
-                "note_index": idx,
-                "applies": True,
-                "directive_type": "no_discharge_window",
-                "structured_adjustment": {"hours": hours if hours else [18, 19]},
-                "explanation": note,
-            })
-            continue
-
-        # 4. Minimum battery reserve
-        if any(p in lower for p in ["reserve", "minimum battery", "min battery"]):
-            m_kwh = re.search(r"(\d+(?:\.\d+)?)\s*kwh", lower)
-            val = float(m_kwh.group(1)) if m_kwh else 50.0
-            results.append({
-                "note_index": idx,
-                "applies": True,
-                "directive_type": "minimum_battery_reserve",
-                "structured_adjustment": {"hours": hours if hours else list(range(24)), "minimum_energy_kwh": val},
-                "explanation": note,
-            })
-            continue
-
-        # 5. Max grid window
-        if "grid" in lower and any(p in lower for p in ["max", "cap", "limit"]):
-            m_kwh = re.search(r"(\d+(?:\.\d+)?)\s*kwh", lower)
-            val = float(m_kwh.group(1)) if m_kwh else 100.0
-            results.append({
-                "note_index": idx,
-                "applies": True,
-                "directive_type": "max_grid_window",
-                "structured_adjustment": {"hours": hours if hours else list(range(24)), "max_grid_kwh": val},
-                "explanation": note,
-            })
-            continue
-
-        # 6. No-op (e.g. cafeteria menu, weather commentary, greetings)
-        results.append({
-            "note_index": idx,
-            "applies": False,
-            "directive_type": "no_op",
-            "structured_adjustment": None,
-            "explanation": note,
-        })
-
-    return results
-
-
-async def interpret_notes(
-    operator_notes: List[str],
-    battery: Optional[Battery] = None,
-    hours: Optional[Any] = None,
-    **kwargs: Any,
-) -> List[Dict[str, Any]]:
-    """Interpret campus operator notes into structured energy directives.
-
-    Calls the LLM provider via AsyncOpenAI. Falls back gracefully to heuristic
-    parsing if network or provider issues occur.
+def _strip_code_fences(text: str) -> str:
     """
-    directives: List[Dict[str, Any]] = []
+    Some models return:
+    ```json
+    {...}
+    ```
+    This removes the fences before JSON parsing.
+    """
+    text = text.strip()
+
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text,
+                      flags=re.IGNORECASE | re.MULTILINE)
+        text = re.sub(r"\s*```$", "", text)
+
+    return text.strip()
+
+
+def _extract_json(text: str) -> Any:
+    """
+    Robustly extract JSON from LLM response.
+    Handles:
+    - pure JSON
+    - markdown code fences
+    - JSON embedded in extra text
+    """
+    cleaned = _strip_code_fences(text)
+
+    # First try direct parse
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Try to find a JSON object
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = cleaned[start: end + 1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    # Try to find a JSON array
+    start = cleaned.find("[")
+    end = cleaned.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        candidate = cleaned[start: end + 1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError("LLM response did not contain valid JSON.")
+
+
+async def _call_llm(messages: list[dict[str, str]], use_json_mode: bool):
+    current_client = _get_client()
+    kwargs: dict[str, Any] = {
+        "model": os.getenv("PUKU_MODEL", "gpt-4o-mini"),
+        "messages": messages,
+        "temperature": 0.0,
+    }
+
+    if use_json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    return await current_client.chat.completions.create(**kwargs)
+
+
+async def interpret_notes(operator_notes: list[str], battery: Battery) -> list[dict]:
+    """
+    Uses puku.sh LLM to interpret operator notes into raw structured dictionaries.
+
+    Returns:
+        list[dict]
+
+    Example raw output:
+    [
+        {
+            "note_index": 0,
+            "applies": true,
+            "directive_type": "solar_reduction",
+            "structured_adjustment": {
+                "hours": [13, 14],
+                "factor": 0.2
+            },
+            "explanation": "..."
+        }
+    ]
+    """
+    if not operator_notes:
+        return []
+
+    if not os.getenv("PUKU_API_KEY"):
+        raise ValueError("PUKU_API_KEY is not set.")
+
+    user_msg = "Battery context:\n"
+    user_msg += f"- capacity_kwh: {battery.capacity_kwh}\n"
+    user_msg += f"- initial_energy_kwh: {battery.initial_energy_kwh}\n"
+    user_msg += f"- minimum_energy_kwh: {battery.minimum_energy_kwh}\n"
+    user_msg += f"- max_charge_kwh_per_hour: {battery.max_charge_kwh_per_hour}\n"
+    user_msg += f"- max_discharge_kwh_per_hour: {battery.max_discharge_kwh_per_hour}\n\n"
+
+    user_msg += "Operator notes:\n"
+    for i, note in enumerate(operator_notes):
+        user_msg += f"[{i}] {note}\n"
+
+    user_msg += "\nReturn ONLY valid JSON with top-level key 'interpretations'."
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
 
     try:
-        user_prompt = _build_user_prompt(operator_notes)
-        response = await client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0,
-            response_format={"type": "json_object"},
-        )
+        try:
+            response = await _call_llm(messages, use_json_mode=True)
+        except Exception as exc:
+            err_text = str(exc).lower()
+            # Some providers may not support response_format. Retry once without it.
+            if "response_format" in err_text or "json" in err_text:
+                logger.warning(
+                    "LLM JSON mode failed, retrying without response_format: %s", exc)
+                response = await _call_llm(messages, use_json_mode=False)
+            else:
+                raise
 
-        content = response.choices[0].message.content or "{}"
-        data = json.loads(content)
+        content = response.choices[0].message.content or ""
+        data = _extract_json(content)
 
         if isinstance(data, dict):
-            raw_directives = data.get(
-                "directives", data.get("directive_interpretation", []))
-            if isinstance(raw_directives, list):
-                directives = raw_directives
-            elif isinstance(raw_directives, dict):
-                directives = [raw_directives]
-        elif isinstance(data, list):
-            directives = data
+            for key in ("interpretations", "directives", "notes", "results"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return value
 
-        if not directives:
-            logger.warning(
-                "LLM returned empty directives; using heuristic fallback")
-            directives = _heuristic_fallback(operator_notes)
+            # If model returned a single object instead of array
+            if "directive_type" in data or "note_index" in data:
+                return [data]
 
+        if isinstance(data, list):
+            return data
+
+        raise ValueError("LLM JSON did not contain an interpretations array.")
+
+    except ValueError:
+        raise
     except Exception as exc:
-        logger.warning(
-            f"LLM API call failed ({exc}); falling back to heuristic parsing")
-        directives = _heuristic_fallback(operator_notes)
-
-    return directives
-
-
-async def stream_plan_summary(prompt: str):
-    """Example: streaming a human-readable plan_summary via OpenAI."""
-    try:
-        response = await client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": "Summarize the energy plan in 2-3 sentences."},
-                {"role": "user", "content": prompt},
-            ],
-            stream=True,
-        )
-        async for chunk in response:
-            delta = chunk.choices[0].delta.content if chunk.choices else ""
-            if delta:
-                yield delta
-    except Exception as exc:
-        logger.warning(f"Streaming failed: {exc}")
-        yield "Optimized energy plan summary."
+        logger.warning("LLM interpretation failed: %s", exc)
+        raise ValueError(f"LLM interpretation failed: {exc}") from exc

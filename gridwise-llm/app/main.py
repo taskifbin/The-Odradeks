@@ -61,11 +61,13 @@ async def optimize_energy(request: ScenarioRequest):
                 battery=request.battery,
             )
         except Exception as exc:
-            # Safe fallback: if LLM fails, treat all notes as no_op.
-            # This keeps the API alive and still returns a valid schedule.
-            logger.warning(
-                f"LLM interpretation failed, falling back to no_op: {exc}")
-            raw_interpretations = []
+            # DEBUG: Print full traceback to console
+            import traceback
+            traceback.print_exc()
+
+            # TEMPORARY: Return the error in the response so you can see it via curl
+            raise HTTPException(
+                status_code=500, detail=f"LLM ERROR: {str(exc)}")
 
         # ------------------------------------------------------------
         # STEP 2: Deterministic guardrails
@@ -74,6 +76,7 @@ async def optimize_energy(request: ScenarioRequest):
             raw_interpretations=raw_interpretations,
             battery=request.battery,
             num_notes=len(request.operator_notes),
+            operator_notes=request.operator_notes,
         )
 
         # ------------------------------------------------------------
