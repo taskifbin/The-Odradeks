@@ -23,6 +23,12 @@ APP_DIR = REPO_ROOT / "gridwise-llm"
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
+# Auto-detect venv site-packages if running with system Python
+venv_site = APP_DIR / "venv" / "lib" / \
+    f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+if venv_site.exists() and str(venv_site) not in sys.path:
+    sys.path.insert(0, str(venv_site))
+
 
 class TestGridWiseService(unittest.TestCase):
     def setUp(self):
