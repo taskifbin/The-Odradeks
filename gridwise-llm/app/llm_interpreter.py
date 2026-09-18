@@ -1,138 +1,78 @@
 import os
-from typing import Dict, List
-
-from guardrails import Guard
+import json
+import logging
 from openai import AsyncOpenAI
-from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
-from .guardrails import (
-    AppliesNoOpConsistency,
-    NonNegativeNumber,
-    NoteIndexCoverage,
-    SolarFactorRange,
-    ValidDirectiveType,
-    ValidHourWindow,
-)
-from .schemas import DirectiveInterpretation, HourEntry
+from app.schemas import Battery
 
-# Requires OPENAI_API_KEY to be set in the environment (.env / Docker secret)
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 client = AsyncOpenAI(
     api_key=os.getenv("PUKU_API_KEY", "dummy_key_for_local_test"),
     base_url=os.getenv("PUKU_BASE_URL", "https://api.puku.sh/v1"),
 )
 
-SYSTEM_PROMPT = """You convert campus operator notes into structured energy directives.
+MODEL = os.getenv("PUKU_MODEL", "gpt-4o-mini")
 
-Supported directive types ONLY:
-- solar_reduction: {"hours": [...], "factor": number}   (usable fraction remaining, 0-1)
-- minimum_battery_reserve: {"hours": [...], "minimum_energy_kwh": number}
-- no_charge_window: {"hours": [...]}
-- no_discharge_window: {"hours": [...]}
-- max_grid_window: {"hours": [...], "max_grid_kwh": number}
-- no_op: structured_adjustment is null
+SYSTEM_PROMPT = """You are an expert energy grid operator assistant. 
+Your task is to interpret 1-3 natural-language operator notes into structured directives for a 24-hour energy optimization model.
 
-Rules:
-- Every note produces exactly one entry, in note_index order.
-- Hours use the [start, end) convention: "1 PM to 3 PM" -> hours [13, 14].
-- Never invent demand, tariff, solar, or battery numbers that are not stated in the note.
-- Never invent a directive type outside the six supported types.
-- If a note doesn't affect the 24-hour energy schedule, mark it no_op.
-- Respond with a JSON object only — no prose, no markdown fences.
+Supported directive types and their REQUIRED `structured_adjustment` shapes:
+1. "solar_reduction": {"hours": [int, ...], "factor": float} 
+   - IMPORTANT: 'factor' is the REMAINING usable fraction. (e.g., "80% reduction" -> factor: 0.2).
+2. "minimum_battery_reserve": {"hours": [int, ...], "minimum_energy_kwh": float}
+3. "no_charge_window": {"hours": [int, ...]}
+4. "no_discharge_window": {"hours": [int, ...]}
+5. "max_grid_window": {"hours": [int, ...], "max_grid_kwh": float}
+6. "no_op": null (Use this ONLY if the note is irrelevant).
+
+STRICT RULES:
+- Return a JSON object with a single key "interpretations" containing an array of objects.
+- Each object MUST have: "note_index", "applies", "directive_type", "structured_adjustment", "explanation".
+- For "no_op", "applies" MUST be false, and "structured_adjustment" MUST be null.
+- Time windows are start-inclusive, end-exclusive. "1 PM to 3 PM" means hours [13, 14].
+- "hours" arrays must contain unique integers 0-23 in ascending order.
 """
 
 
-class DirectiveList(BaseModel):
-    directives: List[DirectiveInterpretation] = Field(...)
+async def interpret_notes(operator_notes: list[str], battery: Battery) -> list[dict]:
+    user_msg = "Battery Context:\n"
+    user_msg += f"- Capacity: {battery.capacity_kwh} kWh\n"
+    user_msg += f"- Base Minimum: {battery.minimum_energy_kwh} kWh\n\n"
 
-
-def _build_user_prompt(operator_notes: List[str]) -> str:
-    notes_block = "\n".join(f"{i}: {note}" for i, note in enumerate(operator_notes))
-    return (
-        f"Operator notes (note_index: text):\n{notes_block}\n\n"
-        f"Return one directive_interpretation entry per note, in note_index order."
-    )
-
-
-def _build_guard(num_notes: int) -> Guard:
-    return (
-        Guard.for_pydantic(DirectiveList)
-        .use(ValidDirectiveType, on="directives.*.directive_type", on_fail="fix")
-        .use(SolarFactorRange, on="directives.*.structured_adjustment.factor", on_fail="fix")
-        .use(
-            NonNegativeNumber,
-            on="directives.*.structured_adjustment.minimum_energy_kwh",
-            on_fail="fix",
-        )
-        .use(
-            NonNegativeNumber,
-            on="directives.*.structured_adjustment.max_grid_kwh",
-            on_fail="fix",
-        )
-        .use(ValidHourWindow, on="directives.*.structured_adjustment.hours", on_fail="fix")
-        .use(AppliesNoOpConsistency, on="directives.*", on_fail="fix")
-        .use(
-            NoteIndexCoverage,
-            on="directives",
-            on_fail="exception",  # can't safely guess a missing/duplicate note mapping
-            metadata={"num_notes": num_notes},
-        )
-    )
-
-
-def interpret_notes(operator_notes: List[str], hours: List[HourEntry]) -> List[Dict]:
-    """
-    Returns a list of validated directive_interpretation dicts, or raises
-    ValueError if the LLM output can't be repaired into a valid response
-    (surface this as a controlled 422/500 in main.py, never crash the service, never invent a directive type).
-    SAFE FAILURE requirement — never crash, never invent a directive).
-    """
-    guard = _build_guard(num_notes=len(operator_notes))
+    user_msg += "Operator Notes:\n"
+    for i, note in enumerate(operator_notes):
+        user_msg += f"[{i}] {note}\n"
 
     try:
-        result = guard(
+        response = await client.chat.completions.create(
+            model=MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": _build_user_prompt(operator_notes)},
+                {"role": "user", "content": user_msg}
             ],
-            model=MODEL,
-            temperature=0,
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            timeout=15.0,
         )
-    except Exception as exc:  # noqa: BLE001 — surfaced as a controlled error upstream
-        raise ValueError(f"LLM interpretation failed validation: {exc}") from exc
 
-    if not result.validation_passed or result.validated_output is None:
-        raise ValueError("LLM output failed guardrails validation and could not be repaired")
+        raw_content = response.choices[0].message.content
+        if not raw_content:
+            raise ValueError("LLM returned empty content")
 
-    return result.validated_output["directives"]
+        raw_data = json.loads(raw_content)
 
+        if isinstance(raw_data, dict) and "interpretations" in raw_data:
+            return raw_data["interpretations"]
+        elif isinstance(raw_data, list):
+            return raw_data
+        else:
+            raise ValueError(
+                f"Unexpected LLM JSON structure: {type(raw_data)}")
 
-# ---------------------------------------------------------------------------
-# Streaming — for reference only.
-#
-# Structured JSON (the directive_interpretation array) is NOT a good fit for
-# streaming: guardrails on nested list/dict fields need the whole object to
-# check things like note_index coverage, so `interpret_notes` above should
-# stay a single blocking call.
-#
-# Streaming IS useful for the free-text `plan_summary` field in the response
-# — but per Section 02, an LLM call used only for plan_summary/cosmetic text
-# does NOT satisfy the "LLM must be part of the interpretation path"
-# requirement. Use this only as an additive UX touch on top of
-# `interpret_notes`, never as a substitute for it.
-# ---------------------------------------------------------------------------
-
-def stream_plan_summary(prompt: str):
-    """Example: streaming a human-readable plan_summary via OpenAI."""
-    guard = Guard()  # no structural validators needed for free text
-    stream = guard(
-        messages=[
-            {"role": "system", "content": "Summarize the energy plan in 2-3 sentences."},
-            {"role": "user", "content": prompt},
-        ],
-        model=MODEL,
-        stream=True,
-    )
-    for chunk in stream:
-        yield chunk.validated_output
+    except Exception as e:
+        logger.error(f"LLM interpretation failed: {e}")
+        raise ValueError(f"LLM interpretation failed: {str(e)}")
