@@ -105,6 +105,8 @@ docker run -d \
 
 ## 🧪 Testing
 
+All test scenarios and test scripts are centralized in the `tests/` directory.
+
 ### 1. Health Check
 
 Verifies the service is up and listening.
@@ -116,22 +118,26 @@ curl http://localhost:8000/health
 
 ### 2. Optimization Request
 
-Send a sample scenario with operator notes.
+Send a sample scenario with operator notes:
 
 ```bash
 curl -X POST http://localhost:8000/optimize-energy \
   -H "Content-Type: application/json" \
-  -d @test.json
+  -d @tests/test.json
 ```
 
-_(See `test.json` in repo root for a complete example payload)_
+_(Or `cd tests && curl -X POST http://localhost:8000/optimize-energy -H "Content-Type: application/json" -d @test.json`)_
 
-### 3. Public Sample Validation
+### 3. Automated Test Suite
 
-Run the provided script to validate against public samples:
+Run the automated test runner to validate all scenarios in `tests/`:
 
 ```bash
-python scripts/test_public_samples.py
+# Run unit & integration tests + live sample validation
+./tests/run_tests.sh
+
+# Or validate live endpoint directly against all test scenarios
+python tests/test_public_samples.py http://localhost:8000
 ```
 
 ## 🔐 Security & Secrets
