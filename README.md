@@ -33,19 +33,19 @@ graph TD
 
 ### Core Components
 
-1.  **LLM Interpretation (`app/llm_interpreter.py`):**
+1.  **LLM Interpretation (`gridwise-llm/app/llm_interpreter.py`):**
     - Uses **Puku.sh** (OpenAI-compatible API) to parse natural language operator notes.
     - Temperature set to `0.0` for deterministic outputs.
     - Strict JSON schema enforcement via prompt engineering.
     - Handles timeouts and API failures gracefully by falling back to `no_op`.
 
-2.  **Deterministic Guardrails (`app/guardrails.py`):**
+2.  **Deterministic Guardrails (`gridwise-llm/app/guardrails.py`):**
     - Validates raw LLM output against physical constraints (Hours 0-23, Factors 0-1).
     - Repairs common errors (e.g., converting "1 PM to 3 PM" to `[13, 14]`).
     - Ensures exactly one interpretation per note, ordered by index.
     - Rejects hallucinated directives safely.
 
-3.  **Mathematical Optimizer (`app/optimizer.py`):**
+3.  **Mathematical Optimizer (`gridwise-llm/app/optimizer.py`):**
     - Solves the 24-hour energy scheduling problem using **Linear Programming (PuLP)**.
     - Objective: Minimize `total_cost_bdt`.
     - Constraints: Energy balance, battery physics, solar limits, and operator directives.
@@ -85,6 +85,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ### Build Image
 
 ```bash
+cd gridwise-llm
 docker build -t gridwise-optimizer:latest .
 ```
 

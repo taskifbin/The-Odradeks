@@ -5,7 +5,9 @@
 
 # ── Python Virtual Environment ──
 venv/
+**/venv/
 env/
+**/env/
 ENV/
 
 # ── Python Bytecode & Cache ──

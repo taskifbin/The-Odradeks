@@ -5,4 +5,3 @@ pulp==2.9.0
 pydantic==2.9.2
 python-dotenv==1.0.1
 httpx==0.27.2
-guardrails-ai==0.5.15
