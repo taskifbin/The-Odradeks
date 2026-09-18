@@ -2,6 +2,7 @@ import os
 from typing import Dict, List
 
 from guardrails import Guard
+from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
 from .guardrails import (
@@ -16,6 +17,11 @@ from .schemas import DirectiveInterpretation, HourEntry
 
 # Requires OPENAI_API_KEY to be set in the environment (.env / Docker secret)
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+client = AsyncOpenAI(
+    api_key=os.getenv("PUKU_API_KEY", "dummy_key_for_local_test"),
+    base_url=os.getenv("PUKU_BASE_URL", "https://api.puku.sh/v1"),
+)
 
 SYSTEM_PROMPT = """You convert campus operator notes into structured energy directives.
 
