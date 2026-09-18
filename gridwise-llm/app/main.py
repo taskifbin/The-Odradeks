@@ -7,7 +7,6 @@ from app.schemas import (
     HealthResponse,
 )
 from app.llm_interpreter import interpret_notes
-from app.guardrails import validate_directives
 from app.optimizer import optimize_schedule
 
 app = FastAPI(
@@ -37,53 +36,48 @@ async def health_check():
 
 
 @app.post("/optimize-energy", response_model=OptimizeResponse, tags=["Optimization"])
-async def optimize_energy(request: ScenarioRequest):
+def optimize_energy(request: ScenarioRequest):
     """
-    Main endpoint: 
-    1. Interprets operator notes via LLM.
-    2. Validates with deterministic guardrails.
-    3. Optimizes the 24-hour energy schedule.
+    Main endpoint:
+    1. Interprets operator notes via LLM (guardrails run inline, Section 08).
+    2. Optimizes the 24-hour energy schedule (Section 05-09).
+
+    NOTE: defined as a plain `def`, not `async def`. interpret_notes() makes
+    a blocking network call to the LLM provider — FastAPI automatically runs
+    sync path operations in a threadpool, which keeps that call from
+    blocking the event loop without needing `await`/asyncio plumbing here.
     """
     try:
-        # STEP 1: LLM Interpretation
-
-        raw_interpretations = await interpret_notes(
+        # STEP 1: LLM Interpretation + inline guardrails (Section 03, 08)
+        # interpret_notes() already runs the Guard(...).use(...) validators
+        # from guardrails.py before returning — its output is trusted.
+        validated_directives = interpret_notes(
             operator_notes=request.operator_notes,
-            battery=request.battery
+            hours=request.hours,
         )
 
-        # STEP 2: Deterministic Guardrails
-        # Cleans, validates, and enforces strict rules on the LLM's raw output
-        validated_directives = validate_directives(
-            raw_interpretations=raw_interpretations,
-            battery=request.battery,
-            num_notes=len(request.operator_notes)
-        )
-
-        # STEP 3: Mathematical Optimization
-        # Solves the Linear Programming problem to minimize grid cost
+        # STEP 2: Mathematical Optimization (Section 05-09)
         optimization_result = optimize_schedule(
             hours=request.hours,
             battery=request.battery,
-            directives=validated_directives
+            directives=validated_directives,
         )
 
-        # STEP 4: Construct and Return Final Response
+        # STEP 3: Construct and Return Final Response
         return OptimizeResponse(
             scenario_id=request.scenario_id,
             directive_interpretation=validated_directives,
-
-            **optimization_result
+            **optimization_result,
         )
 
     except ValueError as e:
-
+        # Malformed/unrecoverable LLM output, or an infeasible schedule —
+        # both are "controlled" failures per Section 08's SAFE FAILURE rule.
         raise HTTPException(status_code=422, detail=str(e))
 
     except Exception as e:
-
         print(f"[ERROR] Internal optimization failure: {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail="Internal server error during optimization."
+            detail="Internal server error during optimization.",
         )
