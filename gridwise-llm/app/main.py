@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -8,6 +10,8 @@ from app.schemas import (
 )
 from app.llm_interpreter import interpret_notes
 from app.optimizer import optimize_schedule
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="GridWise LLM Energy Optimizer",
@@ -76,8 +80,8 @@ def optimize_energy(request: ScenarioRequest):
         raise HTTPException(status_code=422, detail=str(e))
 
     except Exception as e:
-        print(f"[ERROR] Internal optimization failure: {str(e)}")
+        logger.exception("Internal optimization failure")
         raise HTTPException(
             status_code=500,
             detail="Internal server error during optimization.",
-        )
+        ) from e
