@@ -1,10 +1,11 @@
+import asyncio
 import os
 import re
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
-from pathlib import Path
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
@@ -26,8 +27,8 @@ def _get_client() -> AsyncOpenAI:
 
     api_key = os.getenv("PUKU_API_KEY")
     base_url = os.getenv("PUKU_BASE_URL", "https://api.puku.sh/v1")
-    timeout = float(os.getenv("PUKU_TIMEOUT_SECONDS", "12"))
-    max_retries = int(os.getenv("PUKU_MAX_RETRIES", "1"))
+    timeout = float(os.getenv("PUKU_TIMEOUT_SECONDS", "10.0"))
+    max_retries = int(os.getenv("PUKU_MAX_RETRIES", "0"))
 
     return AsyncOpenAI(
         api_key=api_key or "missing-puku-api-key",
@@ -312,14 +313,16 @@ async def interpret_notes(operator_notes: list[str], battery: Battery) -> list[d
 
     try:
         try:
-            response = await _call_llm(messages, use_json_mode=True)
+            response = await asyncio.wait_for(_call_llm(messages, use_json_mode=True), timeout=10.0)
+        except asyncio.TimeoutError:
+            raise
         except Exception as exc:
             err_text = str(exc).lower()
             # Some providers may not support response_format. Retry once without it.
             if "response_format" in err_text or "json" in err_text:
                 logger.warning(
                     "LLM JSON mode failed, retrying without response_format: %s", exc)
-                response = await _call_llm(messages, use_json_mode=False)
+                response = await asyncio.wait_for(_call_llm(messages, use_json_mode=False), timeout=10.0)
             else:
                 raise
 
