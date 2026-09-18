@@ -23,28 +23,55 @@ def _directive_settings(
     grid_cap = {hour: float("inf") for hour in _HOURS}
 
     for directive in directives:
-        if not directive.get("applies", False):
+        applies = (
+            directive.get("applies", False)
+            if isinstance(directive, dict)
+            else getattr(directive, "applies", False)
+        )
+        if not applies:
             continue
-        adjustment = directive.get("structured_adjustment") or {}
+
+        raw_adj = (
+            directive.get("structured_adjustment")
+            if isinstance(directive, dict)
+            else getattr(directive, "structured_adjustment", None)
+        )
+        if raw_adj is None:
+            continue
+
+        if isinstance(raw_adj, dict):
+            adjustment = raw_adj
+        elif hasattr(raw_adj, "model_dump"):
+            adjustment = raw_adj.model_dump()
+        else:
+            adjustment = getattr(raw_adj, "__dict__", {})
+
         hours = adjustment.get("hours") or []
-        directive_type = directive.get("directive_type")
+        directive_type = (
+            directive.get("directive_type")
+            if isinstance(directive, dict)
+            else getattr(directive, "directive_type", None)
+        )
 
         if directive_type == "solar_reduction":
-            factor = adjustment["factor"]
-            for hour in hours:
-                solar_fraction[hour] *= factor
+            factor = adjustment.get("factor")
+            if factor is not None:
+                for hour in hours:
+                    solar_fraction[hour] *= float(factor)
         elif directive_type == "minimum_battery_reserve":
-            minimum = adjustment["minimum_energy_kwh"]
-            for hour in hours:
-                reserve[hour] = max(reserve[hour], minimum)
+            minimum = adjustment.get("minimum_energy_kwh")
+            if minimum is not None:
+                for hour in hours:
+                    reserve[hour] = max(reserve[hour], float(minimum))
         elif directive_type == "no_charge_window":
             no_charge.update(hours)
         elif directive_type == "no_discharge_window":
             no_discharge.update(hours)
         elif directive_type == "max_grid_window":
-            maximum = adjustment["max_grid_kwh"]
-            for hour in hours:
-                grid_cap[hour] = min(grid_cap[hour], maximum)
+            maximum = adjustment.get("max_grid_kwh")
+            if maximum is not None:
+                for hour in hours:
+                    grid_cap[hour] = min(grid_cap[hour], float(maximum))
 
     return solar_fraction, no_charge, no_discharge, reserve, grid_cap
 
@@ -68,7 +95,8 @@ def optimize_schedule(
     solutions and does not materially change the cost objective.
     """
     if len(hours) != 24 or {entry.hour for entry in hours} != set(_HOURS):
-        raise ValueError("hours must contain exactly one entry for each hour 0..23")
+        raise ValueError(
+            "hours must contain exactly one entry for each hour 0..23")
 
     by_hour = {entry.hour: entry for entry in hours}
     (
@@ -124,7 +152,8 @@ def optimize_schedule(
             else battery_energy[hour - 1]
         )
         problem += (
-            battery_energy[hour] == previous_energy + charge[hour] - discharge[hour]
+            battery_energy[hour] == previous_energy +
+            charge[hour] - discharge[hour]
         ), f"battery_balance_{hour}"
         problem += battery_energy[hour] >= max(
             battery.minimum_energy_kwh,
